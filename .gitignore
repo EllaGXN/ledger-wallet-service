@@ -1,0 +1,16 @@
+# Compiled binaries
+/ledger-wallet-service
+*.exe
+*.test
+
+# Go build/test artifacts
+*.out
+
+# Environment files
+.env
+.env.local
+
+# Editor/OS cruft
+.DS_Store
+.idea/
+.vscode/
