@@ -8,8 +8,18 @@ import (
 	"time"
 
 	"github.com/google/uuid"
-	_ "github.com/lib/pq"
+	"github.com/lib/pq"
 )
+
+// isUniqueViolation reports whether err is a Postgres unique_violation (23505),
+// which is how we detect a duplicate idempotency key.
+func isUniqueViolation(err error) bool {
+	var pqErr *pq.Error
+	if errors.As(err, &pqErr) {
+		return pqErr.Code == "23505"
+	}
+	return false
+}
 
 type AccountType string
 
@@ -58,8 +68,54 @@ func NewService(db *sql.DB) *Service {
 	return &Service{db: db}
 }
 
-// PostTransaction posts balanced double-entry postings atomically.
+// getByIdempotencyKey returns the previously-posted transaction (with entries)
+// for a given idempotency key, or nil if none exists.
+func (s *Service) getByIdempotencyKey(ctx context.Context, key string) (*Transaction, error) {
+	var tx Transaction
+	var k sql.NullString
+	row := s.db.QueryRowContext(ctx,
+		`SELECT id, idempotency_key, description, posted_at FROM transactions WHERE idempotency_key = $1`, key)
+	if err := row.Scan(&tx.ID, &k, &tx.Description, &tx.PostedAt); err != nil {
+		if err == sql.ErrNoRows {
+			return nil, nil
+		}
+		return nil, err
+	}
+	if k.Valid {
+		tx.IdempotencyKey = &k.String
+	}
+
+	rows, err := s.db.QueryContext(ctx,
+		`SELECT account_id, direction, amount FROM entries WHERE transaction_id = $1`, tx.ID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var e Entry
+		if err := rows.Scan(&e.AccountID, &e.Direction, &e.Amount); err != nil {
+			return nil, err
+		}
+		tx.Entries = append(tx.Entries, e)
+	}
+	return &tx, rows.Err()
+}
+
+// PostTransaction posts balanced double-entry postings atomically. If the
+// request carries an idempotency key that was already used, the original
+// transaction is returned instead of creating a duplicate or erroring out —
+// this is what makes wallet operations safe to retry.
 func (s *Service) PostTransaction(ctx context.Context, txReq Transaction) (*Transaction, error) {
+	if txReq.IdempotencyKey != nil && *txReq.IdempotencyKey != "" {
+		existing, err := s.getByIdempotencyKey(ctx, *txReq.IdempotencyKey)
+		if err != nil {
+			return nil, err
+		}
+		if existing != nil {
+			return existing, nil
+		}
+	}
+
 	// 1. Validate Double-Entry Invariant: Sum(Debits) == Sum(Credits)
 	var totalDebits, totalCredits int64
 	for _, e := range txReq.Entries {
@@ -95,8 +151,19 @@ func (s *Service) PostTransaction(ctx context.Context, txReq Transaction) (*Tran
 	queryTx := `INSERT INTO transactions (id, idempotency_key, description, posted_at) VALUES ($1, $2, $3, $4)`
 	_, err = dbtx.ExecContext(ctx, queryTx, txReq.ID, txReq.IdempotencyKey, txReq.Description, txReq.PostedAt)
 	if err != nil {
-		// PostgreSQL unique_violation code 23505 (Idempotency key hit)
-		return nil, fmt.Errorf("failed to insert transaction (check idempotency): %w", err)
+		if isUniqueViolation(err) && txReq.IdempotencyKey != nil {
+			// Lost a race with a concurrent retry using the same key: the other
+			// request's transaction now exists, so return that instead of erroring.
+			dbtx.Rollback()
+			existing, lookupErr := s.getByIdempotencyKey(ctx, *txReq.IdempotencyKey)
+			if lookupErr != nil {
+				return nil, lookupErr
+			}
+			if existing != nil {
+				return existing, nil
+			}
+		}
+		return nil, fmt.Errorf("failed to insert transaction: %w", err)
 	}
 
 	// Insert Entries
@@ -115,10 +182,26 @@ func (s *Service) PostTransaction(ctx context.Context, txReq Transaction) (*Tran
 	return &txReq, nil
 }
 
+// dbtx is satisfied by both *sql.DB and *sql.Tx, letting balance calculation
+// run either standalone or inside an existing transaction/row lock.
+type dbtx interface {
+	QueryRowContext(ctx context.Context, query string, args ...interface{}) *sql.Row
+}
+
 // CalculateBalance derives balance strictly from ledger entries up to a given time.
 func (s *Service) CalculateBalance(ctx context.Context, accountID uuid.UUID, asOf time.Time) (int64, error) {
+	return calculateBalance(ctx, s.db, accountID, asOf)
+}
+
+// calculateBalanceTx is CalculateBalance scoped to an in-flight *sql.Tx, so the
+// read happens against exactly the state the caller's row lock is holding.
+func (s *Service) calculateBalanceTx(ctx context.Context, tx *sql.Tx, accountID uuid.UUID, asOf time.Time) (int64, error) {
+	return calculateBalance(ctx, tx, accountID, asOf)
+}
+
+func calculateBalance(ctx context.Context, q dbtx, accountID uuid.UUID, asOf time.Time) (int64, error) {
 	var accType AccountType
-	err := s.db.QueryRowContext(ctx, `SELECT type FROM accounts WHERE id = $1`, accountID).Scan(&accType)
+	err := q.QueryRowContext(ctx, `SELECT type FROM accounts WHERE id = $1`, accountID).Scan(&accType)
 	if err != nil {
 		return 0, fmt.Errorf("account not found: %w", err)
 	}
@@ -132,7 +215,7 @@ func (s *Service) CalculateBalance(ctx context.Context, accountID uuid.UUID, asO
 		WHERE e.account_id = $1 AND t.posted_at <= $2
 	`
 	var debits, credits int64
-	if err := s.db.QueryRowContext(ctx, query, accountID, asOf).Scan(&debits, &credits); err != nil {
+	if err := q.QueryRowContext(ctx, query, accountID, asOf).Scan(&debits, &credits); err != nil {
 		return 0, err
 	}
 
@@ -147,10 +230,23 @@ func (s *Service) CalculateBalance(ctx context.Context, accountID uuid.UUID, asO
 	}
 }
 
-// Transfer performs a wallet transfer with lock ordering to prevent deadlock and negative balances.
+// Transfer performs a wallet transfer with lock ordering to prevent deadlock,
+// negative balances, and duplicate postings on retry.
 func (s *Service) Transfer(ctx context.Context, idempotencyKey string, fromAccountID, toAccountID uuid.UUID, amount int64) error {
 	if amount <= 0 {
 		return errors.New("transfer amount must be positive")
+	}
+
+	// Idempotency check happens before we touch locks: a retried request with
+	// a key we've already committed is a no-op success, not an error.
+	if idempotencyKey != "" {
+		existing, err := s.getByIdempotencyKey(ctx, idempotencyKey)
+		if err != nil {
+			return err
+		}
+		if existing != nil {
+			return nil
+		}
 	}
 
 	tx, err := s.db.BeginTx(ctx, nil)
@@ -159,7 +255,7 @@ func (s *Service) Transfer(ctx context.Context, idempotencyKey string, fromAccou
 	}
 	defer tx.Rollback()
 
-	// Prevent Deadlocks: Always lock accounts in deterministic UUID string order
+	// Prevent deadlocks: always lock accounts in deterministic UUID string order.
 	firstLock, secondLock := fromAccountID, toAccountID
 	if fromAccountID.String() > toAccountID.String() {
 		firstLock, secondLock = toAccountID, fromAccountID
@@ -170,8 +266,10 @@ func (s *Service) Transfer(ctx context.Context, idempotencyKey string, fromAccou
 		return fmt.Errorf("failed to lock accounts: %w", err)
 	}
 
-	// Verify balance inside lock
-	balance, err := s.CalculateBalance(ctx, fromAccountID, time.Now().UTC())
+	// Verify balance INSIDE this transaction (via tx, not s.db) so the check
+	// is against the exact state the row lock is holding — a concurrent
+	// transfer blocked on the same lock can't sneak a stale read in between.
+	balance, err := s.calculateBalanceTx(ctx, tx, fromAccountID, time.Now().UTC())
 	if err != nil {
 		return err
 	}
@@ -183,17 +281,27 @@ func (s *Service) Transfer(ctx context.Context, idempotencyKey string, fromAccou
 	txID := uuid.New()
 	desc := fmt.Sprintf("Transfer from %s to %s", fromAccountID, toAccountID)
 
-	_, err = tx.ExecContext(ctx, `INSERT INTO transactions (id, idempotency_key, description) VALUES ($1, $2, $3)`, txID, idempotencyKey, desc)
+	var key *string
+	if idempotencyKey != "" {
+		key = &idempotencyKey
+	}
+	_, err = tx.ExecContext(ctx, `INSERT INTO transactions (id, idempotency_key, description) VALUES ($1, $2, $3)`, txID, key, desc)
 	if err != nil {
-		return fmt.Errorf("idempotency check or transaction insert failed: %w", err)
+		if isUniqueViolation(err) {
+			// Lost a race with a concurrent retry of the same key: the other
+			// request already committed an equivalent transfer, so treat this
+			// as a successful no-op rather than surfacing an error.
+			return nil
+		}
+		return fmt.Errorf("failed to insert transaction: %w", err)
 	}
 
 	entryQuery := `INSERT INTO entries (transaction_id, account_id, direction, amount) VALUES ($1, $2, $3, $4)`
-	// Debit Sender (Liability decreases)
+	// Debit sender (liability decreases)
 	if _, err := tx.ExecContext(ctx, entryQuery, txID, fromAccountID, Debit, amount); err != nil {
 		return err
 	}
-	// Credit Receiver (Liability increases)
+	// Credit receiver (liability increases)
 	if _, err := tx.ExecContext(ctx, entryQuery, txID, toAccountID, Credit, amount); err != nil {
 		return err
 	}

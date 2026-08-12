@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"os"
+	"sync"
 	"testing"
 	"time"
 
@@ -96,4 +97,114 @@ func TestHistoricalBalance(t *testing.T) {
 	balNow, err := svc.CalculateBalance(ctx, wallet, time.Now().UTC())
 	assert.NoError(t, err)
 	assert.Equal(t, int64(8000), balNow)
+}
+
+// TestNoOverdraft proves a withdrawal/transfer cannot push a wallet negative.
+func TestNoOverdraft(t *testing.T) {
+	svc := setupTestService(t)
+	ctx := context.Background()
+
+	clearing := createTestAccount(t, svc, "Clearing", Asset)
+	wallet := createTestAccount(t, svc, "Wallet", Liability)
+
+	// Fund the wallet with 1000.
+	_, err := svc.PostTransaction(ctx, Transaction{
+		Entries: []Entry{
+			{AccountID: clearing, Direction: Debit, Amount: 1000},
+			{AccountID: wallet, Direction: Credit, Amount: 1000},
+		},
+	})
+	assert.NoError(t, err)
+
+	// Attempt to withdraw more than the balance.
+	err = svc.Transfer(ctx, uuid.NewString(), wallet, clearing, 5000)
+	assert.Error(t, err, "expected overdraft to be rejected")
+
+	// Balance must be unchanged.
+	bal, err := svc.CalculateBalance(ctx, wallet, time.Now().UTC())
+	assert.NoError(t, err)
+	assert.Equal(t, int64(1000), bal)
+}
+
+// TestIdempotentRetry proves that submitting the same wallet operation twice
+// with the same idempotency key does not create a duplicate transaction.
+func TestIdempotentRetry(t *testing.T) {
+	svc := setupTestService(t)
+	ctx := context.Background()
+
+	clearing := createTestAccount(t, svc, "Clearing", Asset)
+	wallet := createTestAccount(t, svc, "Wallet", Liability)
+	key := uuid.NewString()
+
+	deposit := func() (*Transaction, error) {
+		return svc.PostTransaction(ctx, Transaction{
+			IdempotencyKey: &key,
+			Description:    "Deposit",
+			Entries: []Entry{
+				{AccountID: clearing, Direction: Debit, Amount: 500},
+				{AccountID: wallet, Direction: Credit, Amount: 500},
+			},
+		})
+	}
+
+	first, err := deposit()
+	assert.NoError(t, err)
+
+	second, err := deposit()
+	assert.NoError(t, err)
+	assert.Equal(t, first.ID, second.ID, "retry must return the original transaction, not a new one")
+
+	// Only one deposit's worth of balance should have landed.
+	bal, err := svc.CalculateBalance(ctx, wallet, time.Now().UTC())
+	assert.NoError(t, err)
+	assert.Equal(t, int64(500), bal)
+
+	// And only one row should exist in entries for this transaction id.
+	var count int
+	err = svc.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM transactions WHERE idempotency_key = $1`, key).Scan(&count)
+	assert.NoError(t, err)
+	assert.Equal(t, 1, count)
+}
+
+// TestConcurrentWithdrawalsOnlyOneSucceeds proves that two simultaneous
+// withdrawals racing against a wallet that can only cover one of them
+// result in exactly one success and one rejection — never both succeeding.
+func TestConcurrentWithdrawalsOnlyOneSucceeds(t *testing.T) {
+	svc := setupTestService(t)
+	ctx := context.Background()
+
+	clearing := createTestAccount(t, svc, "Clearing", Asset)
+	wallet := createTestAccount(t, svc, "Wallet", Liability)
+
+	// Fund the wallet with exactly enough for one withdrawal.
+	_, err := svc.PostTransaction(ctx, Transaction{
+		Entries: []Entry{
+			{AccountID: clearing, Direction: Debit, Amount: 1000},
+			{AccountID: wallet, Direction: Credit, Amount: 1000},
+		},
+	})
+	assert.NoError(t, err)
+
+	var wg sync.WaitGroup
+	results := make([]error, 2)
+	for i := 0; i < 2; i++ {
+		wg.Add(1)
+		go func(idx int) {
+			defer wg.Done()
+			results[idx] = svc.Transfer(ctx, uuid.NewString(), wallet, clearing, 1000)
+		}(i)
+	}
+	wg.Wait()
+
+	successes := 0
+	for _, err := range results {
+		if err == nil {
+			successes++
+		}
+	}
+	assert.Equal(t, 1, successes, "exactly one of two concurrent withdrawals should succeed")
+
+	bal, err := svc.CalculateBalance(ctx, wallet, time.Now().UTC())
+	assert.NoError(t, err)
+	assert.Equal(t, int64(0), bal, "wallet must end at zero, never negative")
 }
