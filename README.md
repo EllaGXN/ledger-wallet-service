@@ -117,7 +117,6 @@ are credit-normal), computed live from the ledger rather than stored.
 - The suggested schema is followed as-is, with two additions: a
   `created_at` timestamp for insertion order distinct from the caller-set
   `posted_at`, and the immutability triggers.
-- There's no `down` migration yet; the schema is additive-only so far.
 - Account existence isn't explicitly pre-checked before posting — an
   invalid account ID is caught by the `entries.account_id` foreign key and
   surfaces as a Postgres error. A friendlier pre-check could be added.
