@@ -133,7 +133,10 @@ func (s *Service) PostTransaction(ctx context.Context, txReq Transaction) (*Tran
 		return nil, fmt.Errorf("unbalanced transaction: total debits (%d) != total credits (%d)", totalDebits, totalCredits)
 	}
 
-	dbtx, err := s.db.BeginTx(ctx, &sql.TxOptions{Isolation: sql.LevelReadCommitted})
+	dbtx, err := s.db.BeginTx(ctx, &sql.TxOptions{
+		Isolation: sql.LevelReadCommitted,
+		ReadOnly:  false,
+	})
 	if err != nil {
 		return nil, err
 	}
