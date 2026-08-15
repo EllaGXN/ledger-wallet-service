@@ -3,6 +3,7 @@ package main
 import (
 	"database/sql"
 	"encoding/json"
+	"fmt"
 	"log"
 	"net/http"
 	"os"
@@ -79,6 +80,22 @@ func (s *Server) handleCreateAccount(w http.ResponseWriter, r *http.Request) {
 	var req CreateAccountReq
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+
+	if req.Name == "" {
+		http.Error(w, "name is required", http.StatusBadRequest)
+		return
+	}
+	if req.Currency == "" {
+		http.Error(w, "currency is required", http.StatusBadRequest)
+		return
+	}
+	switch req.Type {
+	case Asset, Liability, Equity, Revenue, Expense:
+		// valid
+	default:
+		http.Error(w, fmt.Sprintf("invalid account type %q: must be one of asset, liability, equity, revenue, expense", req.Type), http.StatusBadRequest)
 		return
 	}
 
