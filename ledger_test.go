@@ -208,3 +208,42 @@ func TestConcurrentWithdrawalsOnlyOneSucceeds(t *testing.T) {
 	assert.NoError(t, err)
 	assert.Equal(t, int64(0), bal, "wallet must end at zero, never negative")
 }
+
+// TestSelfTransferRejected proves a wallet can't transfer to itself.
+func TestSelfTransferRejected(t *testing.T) {
+	svc := setupTestService(t)
+	ctx := context.Background()
+
+	wallet := createTestAccount(t, svc, "Wallet", Liability)
+
+	err := svc.Transfer(ctx, uuid.NewString(), wallet, wallet, 100)
+	assert.Error(t, err, "transferring an account to itself must be rejected")
+}
+
+// TestTransferToMissingAccountRejected proves a transfer referencing a
+// nonexistent account fails with a clear error rather than a raw DB error.
+func TestTransferToMissingAccountRejected(t *testing.T) {
+	svc := setupTestService(t)
+	ctx := context.Background()
+
+	clearing := createTestAccount(t, svc, "Clearing", Asset)
+	wallet := createTestAccount(t, svc, "Wallet", Liability)
+
+	// Fund the wallet so the only failure reason possible is the missing account.
+	_, err := svc.PostTransaction(ctx, Transaction{
+		Entries: []Entry{
+			{AccountID: clearing, Direction: Debit, Amount: 500},
+			{AccountID: wallet, Direction: Credit, Amount: 500},
+		},
+	})
+	assert.NoError(t, err)
+
+	nonexistent := uuid.New()
+	err = svc.Transfer(ctx, uuid.NewString(), wallet, nonexistent, 100)
+	assert.Error(t, err, "transferring to a nonexistent account must be rejected")
+
+	// Balance must be unaffected.
+	bal, err := svc.CalculateBalance(ctx, wallet, time.Now().UTC())
+	assert.NoError(t, err)
+	assert.Equal(t, int64(500), bal)
+}
