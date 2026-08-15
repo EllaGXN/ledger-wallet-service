@@ -111,12 +111,16 @@ are credit-normal), computed live from the ledger rather than stored.
 - `TestConcurrentWithdrawalsOnlyOneSucceeds` — two goroutines racing to
   withdraw the full balance simultaneously: exactly one succeeds, the
   wallet never goes negative.
+- `TestSelfTransferRejected` — a wallet cannot transfer to itself.
+- `TestTransferToMissingAccountRejected` — a transfer referencing a
+  nonexistent account fails clearly and leaves the balance untouched.
 
 ## Known limitations / deviations
 
 - The suggested schema is followed as-is, with two additions: a
   `created_at` timestamp for insertion order distinct from the caller-set
   `posted_at`, and the immutability triggers.
-- Account existence isn't explicitly pre-checked before posting — an
-  invalid account ID is caught by the `entries.account_id` foreign key and
-  surfaces as a Postgres error. A friendlier pre-check could be added.
+- Account existence isn't checked before posting a raw `/transactions`
+  request (only before wallet deposit/withdraw/transfer) — an invalid
+  account ID there is caught by the `entries.account_id` foreign key and
+  surfaces as a Postgres error.
