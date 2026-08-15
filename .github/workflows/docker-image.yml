@@ -32,10 +32,14 @@ jobs:
         with:
           go-version: '1.22'
 
-      - name: Apply schema migration
+      - name: Apply schema migrations
+        env:
+          PGPASSWORD: postgres
         run: |
-          PGPASSWORD=postgres psql -h localhost -U postgres -d ledger \
-            -f migrations/000001_init_schema.up.sql
+          for f in migrations/*.up.sql; do
+            echo "Applying $f"
+            psql -h localhost -U postgres -d ledger -v ON_ERROR_STOP=1 -f "$f"
+          done
 
       - name: go vet
         run: go vet ./...
