@@ -264,9 +264,24 @@ func (s *Service) Transfer(ctx context.Context, idempotencyKey string, fromAccou
 		firstLock, secondLock = toAccountID, fromAccountID
 	}
 
-	_, err = tx.ExecContext(ctx, `SELECT id FROM accounts WHERE id IN ($1, $2) FOR UPDATE`, firstLock, secondLock)
+	// Lock both accounts (in deterministic order, see above) and, in the same
+	// round trip, confirm both actually exist — a missing account would
+	// otherwise only surface later as an opaque foreign-key-violation error
+	// from the entries insert.
+	rows, err := tx.QueryContext(ctx, `SELECT id FROM accounts WHERE id IN ($1, $2) FOR UPDATE`, firstLock, secondLock)
 	if err != nil {
 		return fmt.Errorf("failed to lock accounts: %w", err)
+	}
+	found := 0
+	for rows.Next() {
+		found++
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	if found < 2 {
+		return errors.New("one or both accounts do not exist")
 	}
 
 	// Verify balance INSIDE this transaction (via tx, not s.db) so the check
