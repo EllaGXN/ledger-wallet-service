@@ -143,6 +143,10 @@ func (s *Server) handleDeposit(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
+	if req.Amount <= 0 {
+		http.Error(w, "amount must be positive", http.StatusBadRequest)
+		return
+	}
 
 	// Deposit: Debit Asset (Clearing), Credit Liability (Wallet)
 	tx := Transaction{
@@ -170,6 +174,10 @@ func (s *Server) handleWithdraw(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
+	if req.Amount <= 0 {
+		http.Error(w, "amount must be positive", http.StatusBadRequest)
+		return
+	}
 
 	// Lock sender wallet and verify non-negative balance before posting
 	err := s.svc.Transfer(r.Context(), req.IdempotencyKey, req.WalletID, req.ClearingID, req.Amount)
@@ -186,6 +194,10 @@ func (s *Server) handleTransfer(w http.ResponseWriter, r *http.Request) {
 	var req TransferReq
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	if req.Amount <= 0 {
+		http.Error(w, "amount must be positive", http.StatusBadRequest)
 		return
 	}
 
