@@ -13,7 +13,6 @@ import (
 	"github.com/stretchr/testify/assert"
 )
 
-// Helper: Setup database connection for testing
 func setupTestService(t *testing.T) *Service {
 	dbURL := os.Getenv("DATABASE_URL")
 	if dbURL == "" {
@@ -28,7 +27,6 @@ func setupTestService(t *testing.T) *Service {
 	return NewService(db)
 }
 
-// Helper: Insert test account directly into DB
 func createTestAccount(t *testing.T, svc *Service, name string, accType AccountType) uuid.UUID {
 	id := uuid.New()
 	query := `INSERT INTO accounts (id, name, type, currency) VALUES ($1, $2, $3, 'USD')`

@@ -55,7 +55,6 @@ func main() {
 	}
 }
 
-// HTTP Request payloads
 type CreateAccountReq struct {
 	Name     string      `json:"name"`
 	Type     AccountType `json:"type"`
@@ -93,7 +92,6 @@ func (s *Server) handleCreateAccount(w http.ResponseWriter, r *http.Request) {
 	}
 	switch req.Type {
 	case Asset, Liability, Equity, Revenue, Expense:
-		// valid
 	default:
 		http.Error(w, fmt.Sprintf("invalid account type %q: must be one of asset, liability, equity, revenue, expense", req.Type), http.StatusBadRequest)
 		return

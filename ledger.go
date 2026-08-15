@@ -116,7 +116,7 @@ func (s *Service) PostTransaction(ctx context.Context, txReq Transaction) (*Tran
 		}
 	}
 
-	// 1. Validate Double-Entry Invariant: Sum(Debits) == Sum(Credits)
+	// Sum debits and credits; a transaction is only valid if they're equal.
 	var totalDebits, totalCredits int64
 	for _, e := range txReq.Entries {
 		if e.Amount <= 0 {
@@ -133,7 +133,6 @@ func (s *Service) PostTransaction(ctx context.Context, txReq Transaction) (*Tran
 		return nil, fmt.Errorf("unbalanced transaction: total debits (%d) != total credits (%d)", totalDebits, totalCredits)
 	}
 
-	// 2. Execute DB Transaction
 	dbtx, err := s.db.BeginTx(ctx, &sql.TxOptions{Isolation: sql.LevelReadCommitted})
 	if err != nil {
 		return nil, err
@@ -147,7 +146,6 @@ func (s *Service) PostTransaction(ctx context.Context, txReq Transaction) (*Tran
 		txReq.PostedAt = time.Now().UTC()
 	}
 
-	// Insert Transaction
 	queryTx := `INSERT INTO transactions (id, idempotency_key, description, posted_at) VALUES ($1, $2, $3, $4)`
 	_, err = dbtx.ExecContext(ctx, queryTx, txReq.ID, txReq.IdempotencyKey, txReq.Description, txReq.PostedAt)
 	if err != nil {
@@ -166,7 +164,6 @@ func (s *Service) PostTransaction(ctx context.Context, txReq Transaction) (*Tran
 		return nil, fmt.Errorf("failed to insert transaction: %w", err)
 	}
 
-	// Insert Entries
 	queryEntry := `INSERT INTO entries (transaction_id, account_id, direction, amount) VALUES ($1, $2, $3, $4)`
 	for _, entry := range txReq.Entries {
 		_, err := dbtx.ExecContext(ctx, queryEntry, txReq.ID, entry.AccountID, entry.Direction, entry.Amount)
@@ -219,7 +216,6 @@ func calculateBalance(ctx context.Context, q dbtx, accountID uuid.UUID, asOf tim
 		return 0, err
 	}
 
-	// Compute based on Account Type Rules
 	switch accType {
 	case Asset, Expense:
 		return debits - credits, nil
@@ -295,7 +291,6 @@ func (s *Service) Transfer(ctx context.Context, idempotencyKey string, fromAccou
 		return fmt.Errorf("insufficient funds: available %d, requested %d", balance, amount)
 	}
 
-	// Prepare postings
 	txID := uuid.New()
 	desc := fmt.Sprintf("Transfer from %s to %s", fromAccountID, toAccountID)
 
