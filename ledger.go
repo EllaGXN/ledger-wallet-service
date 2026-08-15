@@ -236,6 +236,9 @@ func (s *Service) Transfer(ctx context.Context, idempotencyKey string, fromAccou
 	if amount <= 0 {
 		return errors.New("transfer amount must be positive")
 	}
+	if fromAccountID == toAccountID {
+		return errors.New("cannot transfer to the same account")
+	}
 
 	// Idempotency check happens before we touch locks: a retried request with
 	// a key we've already committed is a no-op success, not an error.
