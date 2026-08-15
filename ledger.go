@@ -315,11 +315,15 @@ func (s *Service) Transfer(ctx context.Context, idempotencyKey string, fromAccou
 	}
 
 	entryQuery := `INSERT INTO entries (transaction_id, account_id, direction, amount) VALUES ($1, $2, $3, $4)`
-	// Debit sender (liability decreases)
+	// Debit the source account, credit the destination account. This function
+	// is generic over account type: for a wallet-to-wallet transfer both
+	// sides are liability accounts (debit decreases, credit increases); for
+	// a withdrawal the destination is the asset clearing account instead, so
+	// the same credit decreases it. See the README's "Accounting mapping"
+	// section for the full debit/credit table.
 	if _, err := tx.ExecContext(ctx, entryQuery, txID, fromAccountID, Debit, amount); err != nil {
 		return err
 	}
-	// Credit receiver (liability increases)
 	if _, err := tx.ExecContext(ctx, entryQuery, txID, toAccountID, Credit, amount); err != nil {
 		return err
 	}
